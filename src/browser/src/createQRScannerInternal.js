@@ -21,15 +21,16 @@ module.exports = function(){
   var thisScanCycle = null;
   var nextScan = null;
   var cancelNextScan = null;
+  var snapshotCanvas = null;
+  var snapshotCanvasContext = null;
 
   // standard screen widths/heights, from 4k down to 320x240
   // widths and heights are each tested separately to account for screen rotation
   var standardWidthsAndHeights = [
-    5120, 4096, 3840, 3440, 3200, 3072, 3000, 2880, 2800, 2736, 2732, 2560,
-    2538, 2400, 2304, 2160, 2100, 2048, 2000, 1920, 1856, 1824, 1800, 1792,
-    1776, 1728, 1700, 1680, 1600, 1536, 1440, 1400, 1392, 1366, 1344, 1334,
-    1280, 1200, 1152, 1136, 1120, 1080, 1050, 1024, 1000, 960, 900, 854, 848,
-    832, 800, 768, 750, 720, 640, 624, 600, 576, 544, 540, 512, 480, 320, 240
+    2560, 2048, 2000, 1920,
+    1600, 1536, 1440,
+    1280, 1080, 1024, 960, 854, 848,
+    720, 640, 600, 540, 512, 480, 320, 240
   ];
 
   var facingModes = [
@@ -282,11 +283,16 @@ module.exports = function(){
       }).then(function(mediaStream){
         activeMediaStream = mediaStream;
         var video = getVideoPreview();
-        try{
+
+        // Newer browsers have deprecated `video.src`, so we attempt video.srcObject
+        // first, and then fall back to video.src if that's not supported,
+        // as per https://developer.mozilla.org/en-US/docs/Web/API/HTMLMediaElement/srcObject#Supporting_fallback_to_the_src_property
+        try {
+          video.srcObject = mediaStream;
+        } catch(error) {
           video.src = URL.createObjectURL(mediaStream);
-        }catch(e){
-          video.srcObject = mediaStream // for deprecated browser
         }
+
         success(calcStatus());
       }, function(err){
         // something bad happened
@@ -296,27 +302,35 @@ module.exports = function(){
       });
   }
 
-  function getTempCanvasAndContext(videoElement){
-    var tempCanvas = document.createElement('canvas');
-    var camera = getCurrentCamera();
-    tempCanvas.height = camera.height;
-    tempCanvas.width = camera.width;
-    var tempCanvasContext = tempCanvas.getContext('2d');
-    tempCanvasContext.drawImage(videoElement, 0, 0, camera.width, camera.height);
-    return {
-      canvas: tempCanvas,
-      context: tempCanvasContext
-    };
+  function updateSnapshotCanvas(videoElement){
+    // Use the dimensions of the on-screen display, not the camera dimensions.
+    //
+    // Since we're snapshotting the content of the html element into an image,
+    // we want the width/height to reflect the current rotation of the html
+    // element. Without this, we can run into issues where the image is
+    // vertically squashed.
+    var width = videoElement.clientWidth;
+    var height = videoElement.clientHeight;
+
+    // Force the canvas to match the underlying video presentation element,
+    // to handle cases where the device has changed rotation since the last snapshot
+    snapshotCanvas.width = width;
+    snapshotCanvas.height = height;
+
+    snapshotCanvasContext.drawImage(videoElement, 0, 0, width, height);
   }
 
   function getCurrentImageData(videoElement){
-    var snapshot = getTempCanvasAndContext(videoElement);
-    return snapshot.context.getImageData(0, 0, snapshot.canvas.width, snapshot.canvas.height);
+    updateSnapshotCanvas(videoElement);
+
+    return snapshotCanvasContext.getImageData(0, 0, snapshotCanvas.width, snapshotCanvas.height);
   }
 
   // take a screenshot of the video preview with a temp canvas
   function captureCurrentFrame(videoElement){
-    return getTempCanvasAndContext(videoElement).canvas.toDataURL('image/png');
+    updateSnapshotCanvas(videoElement);
+
+    return snapshotCanvas.toDataURL('image/png');
   }
 
   function initialize(success, error){
@@ -324,6 +338,15 @@ module.exports = function(){
       var workerBlob = new Blob([workerScript],{type: "text/javascript"});
       scanWorker = new Worker(URL.createObjectURL(workerBlob));
     }
+
+    // Create only one in-memory canvas, otherwise memory leaks can lead to
+    // hundreds of canvases, which then causes the browser to run out of
+    // canvas memory
+    if(snapshotCanvas === null){
+      snapshotCanvas = document.createElement('canvas');
+      snapshotCanvasContext = snapshotCanvas.getContext('2d');
+    }
+
     if(!getVideoPreview()){
       // prepare DOM (sync)
       var videoPreview = document.createElement('video');
@@ -340,11 +363,9 @@ module.exports = function(){
 
       var stillImg = document.createElement('div');
       stillImg.setAttribute('id', ELEMENTS.still);
-      stillImg.setAttribute('style', 'display:block;position:fixed;top:50%;left:50%;visibility: hidden;' +
-      'width:auto;height:auto;min-width:100%;min-height:100%;z-index:' + ZINDEXES.still +
-      ';-moz-transform: translateX(-50%) translateY(-50%);-webkit-transform: ' +
-      'translateX(-50%) translateY(-50%);transform:translateX(-50%) translateY(-50%);' +
-      'background-size:cover;background-position:50% 50%;background-color:#FFF;');
+      videoPreview.setAttribute('style', 'display:block;position:fixed;' +
+      'width:100%;height:100%;z-index:' + ZINDEXES.preview +
+      ';background-color:#000;');
 
       document.body.appendChild(videoPreview);
       document.body.appendChild(stillImg);
@@ -412,6 +433,7 @@ module.exports = function(){
     var video = getVideoPreview();
     if(video){
       video.src = '';
+      video.srcObject = null;
     }
     success(calcStatus());
   }
@@ -433,7 +455,11 @@ module.exports = function(){
         }
       };
       thisScanCycle = function(){
-        scanWorker.postMessage(getCurrentImageData(video));
+        var imageData = getCurrentImageData(video);
+        // imageData may be null if we have run out of canvas memory
+        if (imageData){
+          scanWorker.postMessage(imageData);
+        }
         if(cancelNextScan !== null){
           // avoid race conditions, always clear before starting a cycle
           cancelNextScan();
